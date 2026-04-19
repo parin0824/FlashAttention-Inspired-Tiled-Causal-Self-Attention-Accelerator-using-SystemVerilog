@@ -1,0 +1,2 @@
+cycle_count,score_cycles,softmax_cycles,wsum_cycles,load_events,stall_cycles
+57001,16384,1216,4384,520,0
