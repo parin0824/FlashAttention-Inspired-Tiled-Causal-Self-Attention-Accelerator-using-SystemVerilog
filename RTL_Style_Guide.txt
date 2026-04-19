@@ -1,0 +1,648 @@
+================================================================================
+  RTL STYLE GUIDE FOR SYNTHESIZABLE SYSTEMVERILOG
+  Informed by AI failure analysis in Panchul (SNUG Silicon Valley 2026)
+  Target audience: LLM code-generation and debug agents
+================================================================================
+
+This guide defines mandatory rules and best practices for generating correct,
+synthesizable, area- and power-efficient SystemVerilog RTL. Rules marked
+[CRITICAL] represent the most common failure modes observed in AI-generated
+RTL. Violating a [CRITICAL] rule will almost certainly produce a design that
+fails simulation or is unacceptable for tape-out.
+
+--------------------------------------------------------------------------------
+SECTION 1 — FUNDAMENTAL RTL MINDSET
+--------------------------------------------------------------------------------
+
+1.1  RTL is NOT software. Every statement describes hardware that runs every
+     clock cycle simultaneously. There is no sequential execution model.
+
+1.2  Every signal has a known value at every clock edge. Undriven or
+     improperly conditioned signals produce X-propagation in simulation and
+     undefined behavior in silicon.
+
+1.3  Synthesizability is mandatory. Never use:
+       - Initial blocks for logic (only allowed in testbenches)
+       - Delays (#N) in synthesizable code
+       - System tasks ($display, $finish, etc.) in synthesizable code
+       - Dynamic arrays, queues, or associative arrays in synthesizable code
+       - Automatic tasks or functions with dynamic allocation
+       - Real or shortreal data types (use fixed-point encoding instead)
+
+1.4  Think in clock cycles. Every operation across a pipelined sub-block
+     costs one or more clock cycles of latency. This latency is fixed and
+     must be accounted for in your design.
+
+1.5  Read the sub-block code. [CRITICAL]
+     Do not assume a sub-block has latency = 1. Do not assume any particular
+     latency without reading the source or the verified documentation.
+     Extract the actual pipeline depth by tracing always_ff stages in the
+     sub-block. This is a required engineering step, not optional.
+
+
+--------------------------------------------------------------------------------
+SECTION 2 — CLOCKING AND RESET
+--------------------------------------------------------------------------------
+
+2.1  Use a single clock domain unless explicitly required otherwise. Multi-
+     clock designs require CDC synchronizers and are out of scope unless
+     specified.
+
+2.2  All flip-flops must have a reset. Never generate flip-flops without
+     reset. The reset style must be consistent across the entire design.
+     Choose one style per project and apply it uniformly.
+
+     There are four standard configurations. All examples below show a
+     generic register; data width varies in real designs.
+
+     -- (a) SYNCHRONOUS, ACTIVE-HIGH -------------------------------------
+     Reset is sampled on the clock edge. Only clk appears in sensitivity
+     list. Preferred for ASIC flows that use scan-based DFT.
+
+       always_ff @(posedge clk) begin
+           if (rst) q <= '0;
+           else     q <= d;
+       end
+
+     -- (b) SYNCHRONOUS, ACTIVE-LOW --------------------------------------
+     Same as (a) but polarity is inverted. Common when the reset net is
+     driven active-low from a POR or external pin.
+
+       always_ff @(posedge clk) begin
+           if (!rst_n) q <= '0;
+           else        q <= d;
+       end
+
+     -- (c) ASYNCHRONOUS, ACTIVE-HIGH ------------------------------------
+     Reset takes effect immediately regardless of clock. rst appears in
+     the sensitivity list. The if-condition must match the sensitivity
+     event (posedge rst).
+
+       always_ff @(posedge clk or posedge rst) begin
+           if (rst) q <= '0;
+           else     q <= d;
+       end
+
+     -- (d) ASYNCHRONOUS, ACTIVE-LOW -------------------------------------
+     Most widely used configuration in industry ASIC and FPGA designs.
+     rst_n is active-low; the sensitivity list triggers on negedge rst_n.
+     The if-condition checks (!rst_n).
+
+       always_ff @(posedge clk or negedge rst_n) begin
+           if (!rst_n) q <= '0;
+           else        q <= d;
+       end
+
+     SUMMARY TABLE:
+       Style                  | Sensitivity list          | Condition
+       -----------------------|---------------------------|------------------
+       Sync,  active-high     | posedge clk               | if (rst)
+       Sync,  active-low      | posedge clk               | if (!rst_n)
+       Async, active-high     | posedge clk or posedge rst| if (rst)
+       Async, active-low      | posedge clk or negedge rst_n | if (!rst_n)
+
+2.3  CLEAR logic: synchronous clear separate from reset.
+     In addition to reset, some designs require a synchronous CLEAR signal
+     that forces the register to zero mid-operation without asserting the
+     global reset. This is valid and synthesizable. Clear is checked after
+     reset in the priority chain.
+
+     Example using async active-low reset with synchronous clear:
+
+       always_ff @(posedge clk or negedge rst_n) begin
+           if (!rst_n)   q <= '0;   // async reset — highest priority
+           else if (clr) q <= '0;   // sync clear  — second priority
+           else          q <= d;    // normal operation
+       end
+
+     Rules for CLEAR:
+       - clr is always synchronous (sampled at posedge clk). It must NOT
+         appear in the sensitivity list.
+       - clr does not replace reset. Reset still provides the power-on
+         state guarantee; clr provides runtime flushing.
+       - clr must have a defined source and must not be left floating.
+       - Use clr for pipeline flush, FIFO drain, or channel clear
+         operations where full chip reset is not desired.
+
+2.4  Reset must be active on the first cycle the design is used. Every
+     counter, pointer, valid bit, and state register must have a defined
+     reset value. Failing to reset valid bits causes phantom transactions.
+
+2.5  Do not infer latches. Use always_comb for combinational logic. If a
+     signal is not assigned in every branch of a combinational always block,
+     a latch is inferred. This is almost always a bug.
+
+     -- Latch inference from incomplete if-else ---------------------------
+
+       // BAD — infers a latch because 'out' is not assigned when sel==0
+       always_comb begin
+           if (sel) out = a;
+       end
+
+       // GOOD — fully specified with else
+       always_comb begin
+           if (sel) out = a;
+           else     out = b;
+       end
+
+     -- Latch inference from incomplete case (most common in FSMs) --------
+     [CRITICAL] Always include a default branch in every case statement.
+     A case statement without a default leaves outputs undriven for
+     unlisted encodings, causing the synthesis tool to infer a latch to
+     "remember" the previous value. This is especially dangerous in FSMs
+     where an illegal state must not cause the design to hang.
+
+       // BAD — no default; synthesis infers a latch on 'out'
+       always_comb begin
+           case (state)
+               S_IDLE: out = 2'b00;
+               S_LOAD: out = 2'b01;
+               S_RUN:  out = 2'b10;
+               // S_DONE not listed, no default ? latch
+           endcase
+       end
+
+       // GOOD — default catches all unlisted and illegal states
+       always_comb begin
+           case (state)
+               S_IDLE: out = 2'b00;
+               S_LOAD: out = 2'b01;
+               S_RUN:  out = 2'b10;
+               S_DONE: out = 2'b11;
+               default: out = 2'b00;  // safe fallback; no latch inferred
+           endcase
+       end
+
+     -- Default assignment pattern (preferred for complex blocks) ---------
+     Assign all outputs a default value at the top of always_comb, then
+     override selectively. This guarantees no latch regardless of how many
+     branches exist.
+
+       always_comb begin
+           // defaults — all outputs driven; no latches possible
+           next_state = state;
+           out        = '0;
+           valid_out  = 1'b0;
+
+           case (state)
+               S_IDLE: begin
+                   if (start) begin
+                       next_state = S_RUN;
+                       valid_out  = 1'b1;
+                   end
+               end
+               S_RUN: begin
+                   out        = data_in;
+                   next_state = S_DONE;
+               end
+               default: next_state = S_IDLE;
+           endcase
+       end
+
+2.6  Use always_ff exclusively for sequential (clocked) logic.
+     Use always_comb exclusively for combinational logic.
+     Never mix them. Never use plain always in synthesizable RTL.
+
+
+--------------------------------------------------------------------------------
+SECTION 3 — PIPELINE DESIGN [CRITICAL SECTION]
+--------------------------------------------------------------------------------
+
+3.1  Pipelines are not FSMs. [CRITICAL]
+     A static pipeline accepts one new input per clock cycle and produces one
+     output per clock cycle after an initial latency. It does not process one
+     transaction at a time using a state machine.
+
+     If you find yourself writing a state machine to process a single
+     computation across multiple cycles without accepting new inputs, STOP.
+     That is a sequential processor, not a pipeline.
+
+3.2  Every sub-block has a latency measured in clock cycles. [CRITICAL]
+     The output of a sub-block with latency N is valid N clock cycles after
+     its input is applied. You must delay all data paths that arrive earlier
+     by the appropriate number of cycles so that all operands to each stage
+     arrive at the same time.
+
+     Common error: wiring the output of one sub-block directly to the input
+     of another without accounting for the cycle offset. This results in
+     adding/multiplying data from different input transactions.
+
+3.3  Pipeline branch alignment is mandatory. [CRITICAL]
+     When a formula has parallel branches with different latencies, you must
+     insert delay elements (shift registers, FIFOs, or ring buffers) on the
+     shorter branches to align them before any combining operation.
+
+     Example for F = A^5 + 0.3*B + C with mul_latency=3, add_latency=4:
+
+       Branch 1: A -> MUL(A,A) -> MUL(result,result) -> MUL(result,A) -> A^5
+                 latency = 3+3+3 = 9 cycles
+
+       Branch 2: B -> MUL(0.3,B) -> ADD(result, C_delayed_by_3) -> (0.3B+C)
+                 latency = 3+4 = 7 cycles
+
+       Branch 2 arrives 2 cycles early. Insert a 2-deep delay buffer on
+       Branch 2 output before feeding both into the final ADD.
+
+       Final ADD latency = 4 cycles.
+       Total pipeline latency = 9 + 4 = 13 cycles.
+
+3.4  Compute latencies from sub-block code, not assumptions.
+     Trace the always_ff stages inside each sub-block. Count the number of
+     registered pipeline stages. That is the latency.
+
+3.5  Minimize arithmetic blocks. [CRITICAL]
+     Do not use arithmetic sub-blocks to delay data (e.g., adding zero or
+     multiplying by one). Use shift registers, FIFOs, or ring buffers for
+     alignment. Using arithmetic blocks for alignment wastes area and power
+     and will fail constraints on the number of arithmetic instances.
+
+3.6  Exploit mathematical properties to reduce latency and resources.
+       - Use (A^2)^2 * A = A^5 instead of A*A*A*A*A (saves 2 multipliers
+         and 6 cycles of latency).
+       - Use the associativity of addition to reduce pipeline depth:
+         A^5 + (0.3*B + C) is shallower than (A^5 + 0.3*B) + C when the
+         latencies of the branches differ.
+
+3.7  Do not use oversized FIFOs to paper over latency errors. [CRITICAL]
+     A FIFO deep enough to buffer all possible in-flight transactions is not
+     a pipeline. It is a workaround that wastes area and will be caught by
+     resource-count constraints. Fix the pipeline alignment instead.
+
+3.8  Valid bits must be pipelined alongside data. [CRITICAL]
+     Every pipeline stage that contains data also needs a corresponding valid
+     bit that travels with it. Output a result only when its valid bit is
+     high. Valid bits must be reset to 0.
+
+       always_ff @(posedge clk) begin
+           if (rst) begin
+               stage1_valid <= 1'b0;
+               stage2_valid <= 1'b0;
+           end else begin
+               stage1_valid <= in_valid;
+               stage2_valid <= stage1_valid;
+               // data registers
+               stage1_data  <= in_data;
+               stage2_data  <= stage1_data;
+           end
+       end
+
+
+--------------------------------------------------------------------------------
+SECTION 4 — DELAY BUFFERS: SHIFT REGISTERS, RING BUFFERS, AND FIFOs
+--------------------------------------------------------------------------------
+
+4.1  Choose the right delay structure for each use case:
+
+     SHIFT REGISTER — simplest, appropriate for small depths, wastes dynamic
+     power because data moves every cycle regardless of valid state.
+
+     SHIFT REGISTER WITH VALID-GATED ENABLES — preferred over plain shift
+     register. The valid bit propagates and gates the enable on each data
+     register, preventing unnecessary toggling:
+
+       always_ff @(posedge clk) begin
+           valid_sr <= {valid_sr[N-2:0], in_valid};
+           for (int i = N-1; i > 0; i--) begin
+               if (valid_sr[i-1]) data_sr[i] <= data_sr[i-1];
+           end
+           if (in_valid) data_sr[0] <= in_data;
+       end
+
+     RING BUFFER (single pointer) — most power-efficient for fixed-latency
+     pipelines. Data is written once at the current pointer and read after
+     a fixed number of cycles. Pointer increments each cycle.
+
+     FIFO — required when pipeline latency is variable. Use for output
+     buffering in flow-controlled designs (see Section 5).
+
+4.2  For a fixed-latency sideband delay of depth D, prefer a ring buffer
+     over a shift register for widths >= 32 bits because it reduces switching
+     activity.
+
+4.3  Never use SRAM or embedded memory for small delay buffers. Use flip-
+     flop based structures. SRAM has access latency characteristics that
+     do not match simple delay requirements.
+
+
+--------------------------------------------------------------------------------
+SECTION 5 — FLOW CONTROL: VALID/READY HANDSHAKING [CRITICAL SECTION]
+--------------------------------------------------------------------------------
+
+5.1  Valid/Ready (AXI-Stream compatible) protocol rules: [CRITICAL]
+       a. A transfer occurs when BOTH valid AND ready are sampled high on
+          a positive clock edge.
+       b. The sender asserts valid when it has data and must not deassert
+          valid before the transfer occurs.
+       c. Data must remain stable while valid is high and ready is low.
+       d. The sender must NOT wait for ready to be high before asserting
+          valid. Valid is independent of ready on the sender side.
+       e. The receiver may assert ready at any time, including before valid.
+       f. When both are high for multiple consecutive cycles, transfers occur
+          back-to-back without gaps.
+
+5.2  Default state for arg_ready is 1 (not 0). [CRITICAL]
+     A pipeline that is not stalled is ready to accept data. Initializing
+     arg_ready to 0 causes unnecessary stalls and protocol violations.
+
+5.3  Do NOT use a simple FIFO-full signal to gate arg_ready. [CRITICAL]
+     This is the most basic flow-control mistake. If the pipeline has
+     transactions in flight and the downstream backpressures, those
+     in-flight transactions will arrive at a full FIFO and be lost.
+
+       // WRONG — will overflow FIFO if pipeline has in-flight data
+       assign arg_ready = ~fifo_full;
+
+5.4  Use credit-based flow control for pipelines with flow control. [CRITICAL]
+     The correct architecture for adding Valid/Ready to a static pipeline:
+
+       1. Connect the static pipeline output to a FIFO (output FIFO).
+       2. Initialize a credit counter to FIFO_DEPTH at reset.
+       3. Decrement counter when upstream transfer occurs (arg_valid & arg_ready).
+       4. Increment counter when downstream pops from FIFO
+          (result_valid & result_ready).
+       5. Assert arg_ready = (credit_counter != 0).
+
+     This guarantees: (transactions in flight) + (FIFO occupancy) <= FIFO_DEPTH.
+     The FIFO can never overflow.
+
+     Minimum FIFO depth for full back-to-back bandwidth:
+       FIFO_DEPTH >= pipeline_latency + 1
+
+5.5  The "almost full" technique is INCORRECT and must not be used.
+     It wastes pipeline capacity by stalling the upstream even when the
+     FIFO has space, because it does not track in-flight transactions.
+     Use the credit counter approach (5.4) instead.
+
+5.6  Do NOT stop the upstream on any backpressure if there are credits
+     remaining. [CRITICAL]
+     The credit counter tracks total capacity consumed. If credits remain,
+     the pipeline can and should continue accepting inputs.
+
+5.7  For the combinational optimization (smaller FIFO):
+     arg_ready may be asserted when (counter > 0) OR (counter == 0 AND a
+     FIFO pop is occurring this cycle). This allows FIFO_DEPTH = pipeline_depth
+     instead of pipeline_depth+1. However this creates a combinational path
+     from result_ready to arg_ready, which may violate timing. Use only after
+     timing analysis confirms it is acceptable.
+
+5.8  Canonical credit-counter implementation:
+
+       // At reset: credit_counter <= FIFO_DEPTH
+       // upstream_xfer = arg_valid & arg_ready
+       // downstream_pop = result_valid & result_ready (or ~fifo_empty & result_ready)
+
+       always_ff @(posedge clk) begin
+           if (rst) begin
+               credit_counter <= FIFO_DEPTH;
+           end else begin
+               case ({upstream_xfer, downstream_pop})
+                   2'b10: credit_counter <= credit_counter - 1;
+                   2'b01: credit_counter <= credit_counter + 1;
+                   default: credit_counter <= credit_counter; // 00 and 11 cancel
+               endcase
+           end
+       end
+
+       assign arg_ready = (credit_counter != '0);
+
+
+--------------------------------------------------------------------------------
+SECTION 6 — BUILDING HIGH-BANDWIDTH BLOCKS FROM NON-PIPELINED OPERATORS
+--------------------------------------------------------------------------------
+
+6.1  Some operators (e.g., floating-point division) are not pipelined. They
+     cannot accept a new input until the current operation completes. Their
+     latency may also be variable.
+
+6.2  To achieve back-to-back bandwidth from a non-pipelined operator,
+     instantiate N copies of the operator, where N >= maximum_latency.
+     Route input N to divider[N % max_latency] using a rotating counter.
+     Collect results from all instances in order.
+
+6.3  To pipeline a variable-latency non-pipelined operator:
+       Step 1: Convert variable latency to fixed latency.
+               Add a register at the output that holds the result until
+               a counter reaches max_latency, then presents the result.
+               This wastes cycles for early completions but produces
+               predictable, fixed timing.
+       Step 2: Apply the bank-of-N approach from 6.2.
+
+6.4  Use a round-robin or pointer-based arbiter to assign each incoming
+     transaction to the next available operator instance. Track which
+     operator each transaction was sent to so results can be collected in
+     order.
+
+
+--------------------------------------------------------------------------------
+SECTION 7 — DATA TYPES AND WIDTHS
+--------------------------------------------------------------------------------
+
+7.1  Use explicit widths for all signals. Never use unsized integers in
+     synthesizable RTL except for small constants where context is clear.
+
+       logic [63:0] data;       // GOOD
+       logic [31:0] addr;       // GOOD
+       integer      count;      // BAD — implementation-defined width
+
+7.2  Match IEEE 754 format correctly. [CRITICAL]
+       - Single precision (float32): 32 bits  [31:0]
+       - Double precision (float64): 64 bits  [63:0]
+     Do not confuse these. Do not pack floats into integer types unless you
+     are explicitly performing bit-manipulation on the encoding.
+
+7.3  Use logic, not wire or reg, for all signals in SystemVerilog.
+     This avoids driver-conflict ambiguity and is the modern SV convention.
+
+7.4  Use localparam for constants; never use `define in module scope unless
+     required for cross-file sharing.
+
+       localparam int PIPE_DEPTH = 13;
+       localparam int FIFO_DEPTH = PIPE_DEPTH + 1;
+
+7.5  Use signed arithmetic explicitly when needed:
+
+       logic signed [31:0] a, b, result;
+       assign result = a + b;  // signed addition
+
+     Do not mix signed and unsigned without explicit casts.
+
+
+--------------------------------------------------------------------------------
+SECTION 8 — MODULE STRUCTURE AND INTERFACE
+--------------------------------------------------------------------------------
+
+8.1  Module port declarations must use ANSI style:
+
+       module my_block #(
+           parameter int DATA_W = 64
+       ) (
+           input  logic              clk,
+           input  logic              rst,
+           input  logic              arg_valid,
+           output logic              arg_ready,
+           input  logic [DATA_W-1:0] arg_a,
+           input  logic [DATA_W-1:0] arg_b,
+           output logic              result_valid,
+           input  logic              result_ready,
+           output logic [DATA_W-1:0] result
+       );
+
+8.2  Group ports by direction and function: clk/rst first, then upstream
+     interface, then downstream interface.
+
+8.3  Do not modify sub-block interfaces. [CRITICAL]
+     If you are given a library of sub-blocks, use them exactly as defined.
+     Do not re-implement them, do not add ports, do not change their
+     behavior. Your solution wraps them.
+
+8.4  Do not implement your own floating-point arithmetic. [CRITICAL]
+     If a library of FP arithmetic sub-blocks is provided, you must use
+     only those sub-blocks for FP operations. Implementing FP in behavioral
+     code (e.g., using real types) produces non-synthesizable RTL.
+
+8.5  Parameterize widths, depths, and counts. Do not hardcode values that
+     affect portability or area tradeoffs.
+
+
+--------------------------------------------------------------------------------
+SECTION 9 — COMMON RTL BUGS AND HOW TO AVOID THEM
+--------------------------------------------------------------------------------
+
+9.1  Off-by-one in pipeline depth calculation.
+     Symptom: testbench reports data mismatch shifted by 1 or more cycles.
+     Fix: Re-count always_ff stages in each sub-block. Ensure sideband
+     buffers have the correct depth. Add waveform-based debug: print the
+     input and output timestamps and verify the delta equals the expected
+     latency.
+
+9.2  Missing reset on valid bits.
+     Symptom: phantom valid pulses on startup; X-propagation in simulation.
+     Fix: Every valid register must be initialized to 0 at reset.
+
+9.3  Latch inference in combinational blocks.
+     Symptom: simulation passes but synthesis warns about latches; behavior
+     differs between sim and silicon.
+     Fix: Assign a default value at the top of every always_comb block
+     before conditional assignments, or ensure every conditional path
+     assigns every output.
+
+9.4  Fanout of a deep combinational chain driving a registered input.
+     Symptom: timing violations on the critical path.
+     Fix: Insert pipeline registers to break long combinational paths.
+
+9.5  Assuming sub-block latency without verification. [CRITICAL]
+     Symptom: pipeline misalignment; data from cycle N is combined with
+     data from cycle M, producing incorrect results.
+     Fix: Always read the sub-block source and count registered stages.
+     Never write a comment like "assume latency = 1" unless you have
+     verified it.
+
+9.6  Blocking assignments in always_ff.
+     Symptom: simulation race conditions; incorrect waveforms.
+     Fix: Always use non-blocking assignments (<=) in always_ff.
+     Always use blocking assignments (=) in always_comb.
+
+9.7  Driving a signal from multiple always blocks.
+     Symptom: simulator reports "multiple drivers"; synthesis creates
+     short circuits.
+     Fix: Each signal must be driven by exactly one always block or
+     one continuous assign.
+
+9.8  Overflow in counters and pointers.
+     Symptom: counter wraps unexpectedly; ring buffer pointer corrupts.
+     Fix: Size counters to [clog2(MAX_VAL+1)-1:0] or add explicit
+     overflow guards.
+
+9.9  Using blocking assignment for credit counter updates.
+     Symptom: credit counter updates in the wrong order, causing spurious
+     stalls or overflows.
+     Fix: Use non-blocking assignments; let the always_ff evaluate at
+     the clock edge.
+
+
+--------------------------------------------------------------------------------
+SECTION 10 — RESOURCE AND AREA CONSTRAINTS
+--------------------------------------------------------------------------------
+
+10.1 Do not exceed the specified number of arithmetic sub-block instances.
+     Plan the pipeline topology before writing code. Count how many
+     multipliers, adders, and subtractors you need and verify the count
+     against the constraint.
+
+10.2 Do not use arithmetic sub-blocks for alignment or delay. Use
+     flip-flop-based delay buffers (ring buffers, shift registers).
+
+10.3 Do not use embedded SRAMs for small buffers. Use flip-flop arrays.
+
+10.4 Minimize flip-flop count by using ring buffers instead of shift
+     registers for wide data buses with long delay depths.
+
+10.5 Avoid duplicating logic across pipeline branches. Compute a shared
+     intermediate result once and route it to multiple consumers with
+     appropriate delay buffers.
+
+
+--------------------------------------------------------------------------------
+SECTION 11 — VERIFICATION AND SELF-CHECKING
+--------------------------------------------------------------------------------
+
+11.1 Use the provided testbench; do not modify it. [CRITICAL]
+     The testbench is the ground truth. A design that passes only a
+     self-generated testbench is not validated. Re-implementing or
+     modifying the testbench is explicitly disallowed and defeats the
+     purpose of the exercise.
+
+11.2 Do not regenerate sub-blocks. [CRITICAL]
+     Using AI to generate replacements for provided sub-blocks that happen
+     to be compatible with your solution is invalid. The provided sub-blocks
+     define the actual latencies and behaviors you must design around.
+
+11.3 Before claiming a solution is correct, verify:
+       a. Back-to-back throughput: the pipeline must sustain one output
+          per cycle after filling (no bubble cycles during steady state).
+       b. Latency accuracy: the number of cycles from input to output
+          matches the expected pipeline depth.
+       c. Backpressure handling (if flow control is required): the design
+          must pause correctly when result_ready is deasserted and must
+          resume correctly when it reasserts, without losing or duplicating
+          data.
+       d. Reset behavior: the design must produce no valid output during or
+          immediately after reset.
+       e. Corner cases: single transaction, two transactions, and maximum
+          back-to-back transactions must all pass.
+
+11.4 Waveform inspection is mandatory when a testbench fails.
+     Check: when does the first valid output appear? Does it match
+     pipeline_latency cycles after the first valid input? Are inputs and
+     outputs aligned by the correct number of cycles?
+
+
+--------------------------------------------------------------------------------
+SECTION 12 — QUICK REFERENCE CHECKLIST (use before finalizing any design)
+--------------------------------------------------------------------------------
+
+  [ ] All flip-flops have a synchronous or asynchronous reset.
+  [ ] All valid bits are reset to 0.
+  [ ] No latches (all always_comb blocks have a default assignment or full
+      case/if-else coverage).
+  [ ] Sub-block latencies extracted from source, not assumed.
+  [ ] All pipeline branches aligned: shorter branches have delay buffers.
+  [ ] Delay buffer depths are correct (verify by calculation and waveform).
+  [ ] No arithmetic blocks used for delay/alignment.
+  [ ] A^5 computed as (A^2)^2 * A (3 multipliers), not A*A*A*A*A (4 multipliers).
+  [ ] Arithmetic uses addition associativity where it reduces latency.
+  [ ] Valid bits travel with data through every pipeline stage.
+  [ ] Flow control uses credit counter, not FIFO-full signal.
+  [ ] arg_ready default = 1, not 0.
+  [ ] Credit counter initialized to FIFO_DEPTH at reset.
+  [ ] FIFO depth >= pipeline_latency + 1 for back-to-back bandwidth.
+  [ ] No behavioral (non-synthesizable) code in the solution file.
+  [ ] IEEE 754 data widths are correct (32-bit single, 64-bit double).
+  [ ] Resource counts satisfy constraints (arithmetic blocks, flip-flops).
+  [ ] Only provided sub-blocks used for arithmetic; none self-implemented.
+  [ ] Testbench and sub-block files are unmodified.
+  [ ] Design simulated with back-to-back stimulus and backpressure stimulus.
+
+================================================================================
+END OF STYLE GUIDE
+================================================================================

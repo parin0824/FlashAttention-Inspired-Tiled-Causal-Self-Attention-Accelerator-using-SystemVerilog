@@ -1,0 +1,86 @@
+# ============================================================
+# DEPS.yml
+# IO-Aware Tiled Causal Self-Attention Accelerator
+#
+# Simulation target: bench_attention_top
+# Simulator:         any standard SystemVerilog simulator
+#
+# File ownership:
+#   Parin  : attention_pkg, addr_gen, q_buffer, kv_buffer,
+#             output_buffer, perf_counters, attention_controller,
+#             attention_top, tb_attention_top
+#   Amogha : score_engine, dot_product_pe (optional),
+#             mask_unit, row_score_store
+#   Jainil : row_max_unit, exp_lut, row_sum_unit,
+#             reciprocal_lut, normalizer, weighted_sum_engine
+#
+# NOTE: All compute modules (Amogha + Jainil) must be present
+#       before bench_attention_top can compile and simulate.
+# ============================================================
+
+# ----------------------------------------------------------
+# Full simulation target
+# Compile order: package first, then all RTL, then testbench
+# ----------------------------------------------------------
+bench_attention_top:
+  deps:
+    # Shared package — must be first
+    - attention_pkg.sv
+
+    # Parin: address and control infrastructure
+    - addr_gen.sv
+    - q_buffer.sv
+    - kv_buffer.sv
+    - output_buffer.sv
+    - perf_counters.sv
+    - attention_controller.sv
+
+    # Amogha: score path compute modules
+    - score_engine.sv
+    - mask_unit.sv
+    - row_score_store.sv
+
+    # Jainil: softmax and output accumulation modules
+    - row_max_unit.sv
+    - exp_lut.sv
+    - row_sum_unit.sv
+    - reciprocal_lut.sv
+    - normalizer.sv
+    - weighted_sum_engine.sv
+
+    # Parin: top-level integration and testbench
+    - attention_top.sv
+    - tb_attention_top.sv
+
+  top: tb_attention_top
+
+attention_top:
+  deps:
+    # Shared package — must be first
+    - attention_pkg.sv
+
+    # Parin: address and control infrastructure
+    - addr_gen.sv
+    - q_buffer.sv
+    - kv_buffer.sv
+    - output_buffer.sv
+    - perf_counters.sv
+    - attention_controller.sv
+
+    # Amogha: score path compute modules
+    - score_engine.sv
+    - mask_unit.sv
+    - row_score_store.sv
+
+    # Jainil: softmax and output accumulation modules
+    - row_max_unit.sv
+    - exp_lut.sv
+    - row_sum_unit.sv
+    - reciprocal_lut.sv
+    - normalizer.sv
+    - weighted_sum_engine.sv
+
+    # Parin: top-level integration and testbench
+    - attention_top.sv
+
+  top: attention_top
