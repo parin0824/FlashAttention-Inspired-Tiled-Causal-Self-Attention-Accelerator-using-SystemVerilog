@@ -869,4 +869,4 @@ done   ────────────────────────�
 
 ---
 
-*IO-Aware Tiled Causal Self-Attention Accelerator · v1.0 · Parin · Amogha · Jainil*
+*FlashAttention Inspired Tiled Causal Self Attention Accelerator· v1.0 · Parin · Amogha · Jainil*
